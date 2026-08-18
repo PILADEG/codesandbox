@@ -1,11 +1,11 @@
-package org.example.codesandbox.utils;
+package org.example.codesandbox.template;
 
 import cn.hutool.core.date.StopWatch;
 import cn.hutool.core.io.FileUtil;
+import cn.hutool.core.lang.UUID;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
-import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Bind;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Volume;
@@ -16,18 +16,25 @@ import org.example.codesandbox.model.judge.JudgeConfig;
 import org.example.codesandbox.model.judge.enums.JudgeInfoMessageEnum;
 import org.example.codesandbox.model.judge.execute.ExecuteMessage;
 import org.example.codesandbox.model.judge.execute.ExecuteResponse;
+import org.example.codesandbox.utils.ProcessUtils;
 import org.springframework.stereotype.Component;
+
 import javax.annotation.Resource;
-import java.io.*;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
-@Slf4j
 @Component
-public class ProcessUtils {
+@Slf4j
+public abstract class CodeSandBoxTemplate implements CodeSandBox {
+    private static final String GLOBAL_CODE_DIR_NAME ="SampleCodes";
+
+    private static final String SIMPLE_CODE = "SimpleCode";
+
+    private static final String MAIN = "Main";
 
     private static final String RUN_IMAGE = "eclipse-temurin:8-jdk";
 
@@ -50,32 +57,39 @@ public class ProcessUtils {
      * 默认内存限制（MB）
      */
     private static final long DEFAULT_MEMORY_LIMIT = 128L;
-    private static final String MAIN = "Main";
 
-    private static DockerClient dockerClient;
 
-    /**
-     * 通过 setter 注入静态字段，保持 ProcessUtils 方法可静态调用
-     */
     @Resource
-    public void setDockerClient(DockerClient dockerClient) {
-        ProcessUtils.dockerClient = dockerClient;
-    }
+    private  DockerClient dockerClient;
 
-    /**
-     * 宿主机编译完成后，用 Docker 运行编译产物，一个容器逐个执行所有用例。
-     * 输入通过写到挂载目录、容器内用 shell 重定向喂给进程（docker-java 的 exec stdin 通道不可靠）。
-     *
-     * @param path           编译产物所在宿主机目录（会挂载进容器 /app）
-     * @param executeMessage 判题信息，含用例列表和资源限制
-     * @return 判题执行结果，outputList 每个元素对应一个用例的输出
-     */
-    public static ExecuteResponse doExecute(String path, ExecuteMessage executeMessage) {
+    protected File saveCodeToFile(ExecuteMessage executeMessage) {
+        String userDir = System.getProperty("user.dir");
+        String globalCodeDir = userDir + File.separator + GLOBAL_CODE_DIR_NAME;
+        String code = executeMessage.getCode();
+        log.info("code: {}", code);
+        String userCodeParentPath = globalCodeDir + File.separator + UUID.randomUUID();
+        File writeFile = FileUtil.writeString(code, userCodeParentPath + File.separator + MAIN+".java", "UTF-8");
+        return writeFile;
+    }
+    protected ExecuteResponse buildExecuteResponse(ExecuteMessage executeMessage,String path) {
+        String compileCmd = String.format("javac -encoding utf-8 %s", path);
+        try{
+            Process process = Runtime.getRuntime().exec(compileCmd);
+            ExecuteResponse executeResponse = ProcessUtils.buildExecuteResponse(process);
+            log.info("executeResponse: {}", executeResponse);
+            return executeResponse;
+        } catch (Exception e) {
+            log.error("buildExecuteResponse error", e);
+            return ExecuteResponse.builder()
+                    .status(JudgeInfoMessageEnum.SYSTEM_ERROR.getValue())
+                    .errorMessage(e.toString()).build();
+        }
+    }
+    protected ExecuteResponse executeCode(ExecuteMessage executeMessage,String path) {
         String containerId = null;
         ExecuteResponse executeResponse = new ExecuteResponse();
         try {
-            ensureImage(RUN_IMAGE);
-
+            ProcessUtils.ensureImage(RUN_IMAGE);
             JudgeConfig judgeConfig = executeMessage.getJudgeConfig();
             // 单位约定：memoryLimit 以 MB 为单位（如 Postman 传 128 即 128MB）
             long memoryLimitMb = judgeConfig != null && judgeConfig.getMemoryLimit() != null
@@ -87,7 +101,7 @@ public class ProcessUtils {
             log.info("limit_memory: {} MB", memoryLimitMb);
             // 1. 创建常驻容器，挂载编译产物目录
             CreateContainerResponse container = dockerClient.createContainerCmd(RUN_IMAGE)
-                    .withName("sandbox-" + UUID.randomUUID())
+                    .withName("sandbox-" + java.util.UUID.randomUUID())
                     .withCmd("sleep", "infinity")          // 常驻，供后续多次 exec
                     .withNetworkDisabled(true)              // 断网
                     .withHostConfig(HostConfig.newHostConfig()
@@ -127,7 +141,7 @@ public class ProcessUtils {
                         .awaitCompletion(timeLimitMs, TimeUnit.MILLISECONDS);
                 stopWatch.stop();
                 try {
-                    peakMemoryBytes = readContainerPeakMemory(containerId);
+                    peakMemoryBytes = ProcessUtils.readContainerPeakMemory(containerId);
                     log.info("peak_memory: {} MB", peakMemoryBytes / 1024 / 1024);
                 } catch (Exception e) {
                     log.error("读取 cgroup 内存峰值失败", e);
@@ -174,103 +188,42 @@ public class ProcessUtils {
                     .status(JudgeInfoMessageEnum.SYSTEM_ERROR.getValue())
                     .errorMessage(e.getMessage()).build();
         } finally {
-            cleanupContainer(containerId);
-            FileUtil.del(path);
+            ProcessUtils.cleanupContainer(containerId);
         }
     }
-
-    public static void ensureImage(String image) throws Exception {
-        try {
-            dockerClient.inspectImageCmd(image).exec();
-        } catch (NotFoundException e) {
-            log.info("镜像 {} 不存在，开始拉取...", image);
-            dockerClient.pullImageCmd("eclipse-temurin").withTag("8-jdk")
-                    .start().awaitCompletion();
-        }
+    protected boolean deleteFiles (String path) {
+        boolean result = FileUtil.del(path);
+        return result;
     }
 
-    /**
-     * 读取容器 cgroup 内存峰值（bytes）。
-     * cgroup v2 读 memory.peak，v1 兜底 memory.max_usage_in_bytes。
-     * 该值是内核维护的容器生命周期高水位，能准确反映所有用例中的最大内存占用，
-     * 与 docker stats 的采样时机无关。
-     */
-    public static long readContainerPeakMemory(String containerId) throws Exception {
-        ExecCreateCmdResponse cmd = dockerClient.execCreateCmd(containerId)
-                .withCmd("sh", "-c",
-                        "cat /sys/fs/cgroup/memory.peak 2>/dev/null || cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes 2>/dev/null")
-                .withAttachStdout(true)
-                .withAttachStderr(true)
-                .exec();
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        ByteArrayOutputStream err = new ByteArrayOutputStream();
-        dockerClient.execStartCmd(cmd.getId())
-                .exec(new ExecStartResultCallback(out, err))
-                .awaitCompletion(2000, TimeUnit.MILLISECONDS);
-        return Long.parseLong(out.toString(StandardCharsets.UTF_8.name()).trim());
-    }
-
-    public static void cleanupContainer(String containerId) {
-        if (containerId == null) {
-            return;
-        }
-        try {
-            dockerClient.killContainerCmd(containerId).exec();
-        } catch (Exception ignored) {
-        }
-        try {
-            dockerClient.removeContainerCmd(containerId).withForce(true).exec();
-        } catch (Exception ignored) {
-        }
-    }
-
-    public static ExecuteResponse buildExecuteResponse(Process process) {
-        try {
-            Integer exitCode = process.waitFor();
-            if (exitCode == 0){
-                log.info("compile success");
-                BufferedReader bufferedReader = new BufferedReader(
-                        new InputStreamReader(process.getInputStream()));
-                StringBuilder stringBuilder = new StringBuilder();
-                String str;
-                while ((str = bufferedReader.readLine()) != null) {
-                    stringBuilder.append(str);
-                }
-                log.info("compile output: {}", stringBuilder);
-                return ExecuteResponse.builder()
-                        .message(stringBuilder.toString())
-                        .build();
-            }else{
-                log.info("compile error");
-                BufferedReader bufferedReader = new BufferedReader(
-                        new InputStreamReader(process.getInputStream()));
-                StringBuilder stringBuilder = new StringBuilder();
-                String str;
-                while ((str = bufferedReader.readLine()) != null) {
-                    stringBuilder.append(str);
-                }
-                log.info("compile output: {}", stringBuilder);
-                BufferedReader errorReader = new BufferedReader(
-                        new InputStreamReader(process.getErrorStream()));
-                StringBuilder errorBuilder = new StringBuilder();
-                String errorStr;
-                while ((errorStr = errorReader.readLine()) != null) {
-                    errorBuilder.append(errorStr);
-                }
-                log.info("compile error: {}", errorBuilder);
-                return ExecuteResponse.builder()
-                        .status(JudgeInfoMessageEnum.COMPILE_ERROR.getValue())
-                        .errorMessage(errorBuilder.toString())
-                        .message(stringBuilder.toString())
-                        .build();
+    @Override
+    public ExecuteResponse doExecuteCodeSandBoxDocker(ExecuteMessage executeMessage){
+        String parentPath = null;   // 代码所在目录（挂载 / 清理用）
+        try{
+            File writeFile =  saveCodeToFile(executeMessage);
+            String filePath = writeFile.getAbsolutePath();   // Main.java 全路径（编译用）
+            parentPath = writeFile.getParent();              // 父目录（运行挂载 + 清理用）
+            ExecuteResponse compileResponse = buildExecuteResponse(executeMessage, filePath);
+            if (compileResponse.getStatus() != null){
+                return compileResponse;
             }
-        } catch (Exception e) {
-            log.error("compileCmd error", e);
-            return ExecuteResponse
-                    .builder()
-                    .status(JudgeInfoMessageEnum.COMPILE_ERROR.getValue())
+            ExecuteResponse executeResponse = executeCode(executeMessage, parentPath);
+            boolean isDel = deleteFiles(filePath);
+            if (!isDel){
+                log.error("deleteFile error,CodeFilePath = {}", filePath);
+            }
+            return executeResponse;
+        }catch (Exception e){
+            log.info("程序出错: ",e);
+            return ExecuteResponse.builder()
+                    .status(JudgeInfoMessageEnum.SYSTEM_ERROR.getValue())
                     .errorMessage(e.getMessage())
                     .build();
+        }finally {
+            if (parentPath != null && FileUtil.isDirectory(parentPath)) {
+                deleteFiles(parentPath);
+            }
         }
     }
+
 }

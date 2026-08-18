@@ -4,3 +4,6 @@ spring:
 server:
   address: 0.0.0.0
   port: 8201
+# 沙箱鉴权密钥（客户端需传 auth 头 = md5Hex(该值)）
+sandbox:
+  auth-secret: online_judge_project_secret_key
