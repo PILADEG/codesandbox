@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 45 mvn -q spring-boot:run)",
+      "Bash(timeout 50 mvn -q spring-boot:run)",
+      "Bash(echo \"--- 退出码: $? ---\")",
+      "Read(//tmp/**)",
+      "Read(//etc/**)",
+      "Bash(sudo -n true)",
+      "Read(//run/**)",
+      "Bash(systemctl is-active *)",
+      "Bash(javap *)",
+      "Bash(mvn -q compile)",
+      "Bash(timeout 10 curl -sI https://registry-1.docker.io/v2/)",
+      "Bash(javac -version)",
+      "Bash(awk '{print \"该行长度:\", length\\($0\\)}')",
+      "Bash(echo \"退出码: $?\")",
+      "Bash(echo \"编译退出码: $?\")"
+    ]
+  }
+}
