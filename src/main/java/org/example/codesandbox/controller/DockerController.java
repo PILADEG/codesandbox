@@ -37,7 +37,7 @@ public class DockerController {
                                               HttpServletRequest request, HttpServletResponse response) {
         String user_secretKey = request.getHeader(AUTH);
         String secretKey = DigestUtil.md5Hex(authSecret);
-        if (user_secretKey == null || !testSecret.equals(user_secretKey)) {
+        if (user_secretKey == null || !secretKey.equals(user_secretKey)) {
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
             return null;
         }
