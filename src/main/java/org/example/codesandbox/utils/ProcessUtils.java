@@ -146,7 +146,6 @@ public class ProcessUtils {
                 if (exitCode == 0 ){
                     outputList.add(output);
                 }
-                // 3. 每个用例跑完读一次容器 cgroup 内存峰值（bytes）作为指标
 
                 if (exitCode != 0) {
                     errorBuilder.append(error).append("\n");
