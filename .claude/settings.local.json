@@ -15,7 +15,8 @@
       "Bash(javac -version)",
       "Bash(awk '{print \"该行长度:\", length\\($0\\)}')",
       "Bash(echo \"退出码: $?\")",
-      "Bash(echo \"编译退出码: $?\")"
+      "Bash(echo \"编译退出码: $?\")",
+      "Bash(docker run *)"
     ]
   }
 }

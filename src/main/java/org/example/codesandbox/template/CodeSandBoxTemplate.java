@@ -72,17 +72,62 @@ public abstract class CodeSandBoxTemplate implements CodeSandBox {
         return writeFile;
     }
     protected ExecuteResponse buildExecuteResponse(ExecuteMessage executeMessage,String path) {
-        String compileCmd = String.format("javac -encoding utf-8 %s", path);
+        // 独立编译容器：隔离编译期风险，且不污染运行容器的 cgroup 内存峰值
+        String containerId = null;
         try{
-            Process process = Runtime.getRuntime().exec(compileCmd);
-            ExecuteResponse executeResponse = ProcessUtils.buildExecuteResponse(process);
-            log.info("executeResponse: {}", executeResponse);
-            return executeResponse;
+            File codeFile = new File(path);
+            String codeDir = codeFile.getParent();
+            String codeName = codeFile.getName();
+            ProcessUtils.ensureImage(RUN_IMAGE);
+
+            CreateContainerResponse container = dockerClient.createContainerCmd(RUN_IMAGE)
+                    .withName("compile-" + UUID.randomUUID())
+                    .withCmd("sleep", "infinity")
+                    .withNetworkDisabled(true)                       // 断网
+                    .withHostConfig(HostConfig.newHostConfig()
+                            .withMemory(512L * 1024 * 1024)          // 编译期单独给 512MB，避免 javac 被 OOM
+                            .withBinds(new Bind(codeDir, new Volume(WORK_DIR))))
+                    .exec();
+            containerId = container.getId();
+            dockerClient.startContainerCmd(containerId).exec();
+
+            // 容器内编译：-proc:none 关闭注解处理，-J-Xmx256m 限制编译器 JVM 堆
+            ExecCreateCmdResponse compileCmd = dockerClient.execCreateCmd(containerId)
+                    .withCmd("javac", "-proc:none", "-J-Xmx256m", "-encoding", "utf-8",
+                            WORK_DIR + "/" + codeName)
+                    .withAttachStdout(true)
+                    .withAttachStderr(true)
+                    .exec();
+            ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+            ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+            boolean finished = dockerClient.execStartCmd(compileCmd.getId())
+                    .exec(new ExecStartResultCallback(stdout, stderr))
+                    .awaitCompletion(10_000, TimeUnit.MILLISECONDS);
+            if (!finished) {
+                log.error("编译超时，容器: {}", containerId);
+                return ExecuteResponse.builder()
+                        .status(JudgeInfoMessageEnum.SYSTEM_ERROR.getValue())
+                        .errorMessage("编译超时").build();
+            }
+            int exitCode = dockerClient.inspectExecCmd(compileCmd.getId()).exec().getExitCode();
+            String out = stdout.toString(StandardCharsets.UTF_8.name());
+            String err = stderr.toString(StandardCharsets.UTF_8.name());
+            if (exitCode != 0) {
+                log.info("编译错误: {}", err);
+                return ExecuteResponse.builder()
+                        .status(JudgeInfoMessageEnum.COMPILE_ERROR.getValue())
+                        .errorMessage(err)
+                        .message(out).build();
+            }
+            log.info("编译成功");
+            return ExecuteResponse.builder().message(out).build();
         } catch (Exception e) {
             log.error("buildExecuteResponse error", e);
             return ExecuteResponse.builder()
                     .status(JudgeInfoMessageEnum.SYSTEM_ERROR.getValue())
                     .errorMessage(e.toString()).build();
+        } finally {
+            ProcessUtils.cleanupContainer(containerId);
         }
     }
     protected ExecuteResponse executeCode(ExecuteMessage executeMessage,String path) {
